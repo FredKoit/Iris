@@ -1,0 +1,11 @@
+.venv/
+models/
+__pycache__/
+*.pyc
+scratch_*.py
+memory.db
+samples/
+external/
+.venv-clone/
+.vts_token
+.overlay_state.json
