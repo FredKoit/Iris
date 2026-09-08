@@ -8,14 +8,17 @@ component is free and open source.
 
 ## What runs where
 
-The 4 GB of VRAM holds exactly one thing — the language model. Everything else
-is on the CPU, which is why this fits at all.
+The 4 GB of VRAM is built around the language model. Everything else runs on
+the CPU, which is why this fits at all — though the model she ships with,
+qwen3, does not quite fit whole itself: 27% of it spills to CPU too. `llama3.2`
+fits with room to spare and is faster; see "The brain", further down, for why
+qwen3 is the default anyway.
 
 | stage | what | where | measured |
 |---|---|---|---|
 | endpointing | Silero VAD v6 (ships with faster-whisper) | CPU | ~1 ms/frame |
 | transcription | faster-whisper `base.en`, int8 | CPU, 6 threads | 0.70 s, **hidden** |
-| brain | `llama3.2` via Ollama | **GPU, 2.3 GB** | 0.2 s to first phrase |
+| brain | `qwen3:4b-instruct-2507` via Ollama | GPU + 27% CPU, 3.2 GB | 0.56 s to first phrase |
 | speech | Kokoro-82M fp32 ONNX | CPU, 4 threads | 0.6 s opener (RTF 0.43) |
 
 Run `python scripts/latency.py` to reproduce the component timings on your own
@@ -48,23 +51,42 @@ Ollama and the Python 3.12 venv are already installed here. From scratch:
 python -m uv venv --python 3.12 .venv
 python -m uv pip install --python .venv/Scripts/python.exe \
     sounddevice numpy faster-whisper ollama kokoro-onnx
-python scripts/fetch_models.py        # Kokoro weights, ~350 MB
-ollama pull llama3.2
+python scripts/fetch_models.py                    # Kokoro weights, ~350 MB
+ollama pull qwen3:4b-instruct-2507-q4_K_M          # the default brain
 ```
 
 Whisper downloads itself on first run.
 
+The tray icon, global hotkeys, push-to-talk, and the VTube Studio avatar are
+all optional. Each one is silently absent with a one-line message if its
+package is missing, so none of this is required just to talk to her:
+
+```
+python -m uv pip install --python .venv/Scripts/python.exe \
+    pystray pillow pynput websocket-client
+```
+
 ## Use
 
 ```
-.venv\Scripts\python.exe run.py            # talk to her
-.venv\Scripts\python.exe run.py --text     # type instead, same voice and brain
-.venv\Scripts\python.exe run.py --barge-in # interrupt her mid-sentence
+python run.py               talk to her
+python run.py --text        type instead, same voice and brain
+python run.py --barge-in    interrupt her mid-sentence (headphones only)
 ```
 
-`--no-idle` stops her speaking first, `--idle-after SECONDS` changes how long
-she waits. `--list-devices` and `--list-voices` do what they say. `--model`, `--voice` and
-`--whisper` override the config for one run.
+Every other flag:
+
+| flag | effect |
+|---|---|
+| `--push-to-talk` | only listen while a key is held — see below |
+| `--no-idle` | never speak first; only answer when spoken to |
+| `--idle-after SECONDS` | how long she waits before speaking first |
+| `--no-tray` | no tray icon and no global hotkeys |
+| `--no-screen` | do not tell her which application is in front |
+| `--no-timers` | do not act on "remind me in ten minutes" |
+| `--model`, `--voice`, `--whisper` | override the config for one run |
+| `--input-device`, `--output-device` | a mic or speaker by index, from `--list-devices` |
+| `--list-devices`, `--list-voices` | print what is available |
 
 ### Push to talk
 
@@ -224,25 +246,6 @@ Window titles are still the most revealing single string on a machine, so:
 
 Windows only -- it is all user32/kernel32. Elsewhere she simply does not have
 this sense, the same way the overlay is silently absent.
-
-## Hearing names she has learned
-
-`faster-whisper` accepts `hotwords`, and memory already stores the words a
-generic English model gets wrong -- your name, your pets, your projects. The
-fact table is fed straight back into the transcriber, so the longer she knows
-you the better she hears you.
-
-Measured A/B on the same audio:
-
-| | without | with |
-|---|---|---|
-| clean | "I study at Strathmore University" | unchanged |
-| noisy | "I study at **Straffnell** University" | "I study at **Strathmore** University" |
-| noisy | "Read here, talking to **IMS** about JavaScript" | "talking to **Iris** about JavaScript" |
-
-On clean audio it changes nothing. On noisy audio it recovers the names, though
-it does not fix general noise robustness -- one test line stayed garbled either
-way. No downside, and it costs nothing.
 
 ## Speaking first
 
@@ -424,65 +427,11 @@ Those translations are a guess from the names. Run `--sweep` to see what each
 one actually does and rewrite the map to taste. The model also has six unnamed
 `TriggerAnimation` hotkeys that nothing is bound to yet.
 
-## Timers
-
-The one genuinely useful thing she can do with no network, and the thing people
-actually say out loud to a voice.
-
-```
-you:  set a timer for ten minutes
-iris: Fine. 10 minutes.
-you:  remind me in twenty minutes to take the pizza out
-iris: Right. 20 minutes. Take the pizza out.
-      ...
-iris: That's your 20 minutes. Take the pizza out.
-```
-
-"How long is left on the timer" and "cancel the timer" work too. `--no-timers`
-switches the whole thing off.
-
-Durations are parsed rather than pattern-matched a phrase at a time: every
-quantity in the string is summed, so "one hour thirty minutes" needs no rule of
-its own. Two shapes do need one. A plural fraction with its own count --
-"three quarters of an hour" -- reads as 3.25 taken word by word, and the words
-it consumes have to be blanked out afterwards or the same string is *also*
-counted as a whole "an hour". And a bare fraction with no unit at all -- "an
-hour and a half" -- means the unit in front of it.
-
-**A command needs a duration or it is not a command.** "Set a timer" and "timer
-for the pasta" fall through to the brain untouched. Without that rule she would
-have to hold a half-finished command open across turns, and a voice that is
-silently waiting for the rest of your sentence is worse than one that just
-answers you.
-
-Two orderings matter, and both are load-bearing:
-
-- Timers are checked **before** the memory commands. "Forget the timer" is a
-  cancellation, and the memory grammar reads it as an instruction and starts
-  deleting facts about timers.
-- Firing waits for her own sentence and for yours to finish, but is **not**
-  gated on the tray mute or on paused idle chatter. Those switch off her ears
-  and her chatter; neither is a reason to swallow something she was explicitly
-  asked to say.
-
-What she says is a fixed line, not a generated one, for the reason the memory
-acknowledgements are fixed: a timer is a utility, one that waffles for two
-sentences before saying what it was for is worse than one that does not, and a
-generation that fails at the moment the timer fires is the single failure this
-feature cannot afford. `spoken()` is also deliberately not `humanize()` -- a
-timer set for an hour is "an hour", not "about an hour". Rounding is right for
-"how long have we been talking" and wrong for the one thing here whose whole
-point is that it is exact.
-
-Timers live in memory only. A countdown does not survive a restart, because
-restoring one that spent most of its span in a process that was not running is
-a worse answer than losing it. Past `timer_max_s` (twelve hours) she declines
-rather than promising something she will not be alive to do.
-
 ## Memory
 
-She remembers you between sessions. Everything lives in `memory.db` next to the
-code; delete it and she forgets you completely.
+She remembers you between sessions, two ways: automatically, from a background
+extractor, and directly, when you tell her to. Everything lives in `memory.db`
+next to the code; delete it and she forgets you completely.
 
 Two tables. `turns` is the raw log of everything said. `facts` is what actually
 reaches the prompt: short third-person statements about you, deduplicated and
@@ -503,6 +452,34 @@ python scripts/memory.py wipe      start over
 
 Watch for `[remembered] ...` lines while you talk -- that is a consolidation
 pass landing.
+
+### Telling her directly
+
+Consolidation is free to decide a sentence was not worth keeping, and it only
+runs every six replies. That is the wrong shape for an instruction:
+
+```
+you:  remember that I hate mushrooms
+iris: Got it. I'll remember that.
+you:  forget about the mushrooms
+iris: Forgotten.
+```
+
+[commands.py](iris/commands.py) recognises these directly and acts immediately,
+without waiting for the extractor. The hard part is telling an instruction from
+ordinary conversation -- "I remember going there" and "note taking is hard" are
+not commands, and "forgetting the milk was my fault" is not a request to delete
+something about milk. A trailing "?" is read differently in each direction:
+"can you remember my name?" is almost always a real question and is left alone,
+but "can you forget about the microwave?" is never a question about her
+capabilities, and being unable to hear it once let a subject she had invented
+run for twenty turns after being asked twice to drop it.
+
+A bare "forget that" means the thing she just learned; a bare "forget it" is a
+shrug and does nothing, since wiping memory because someone dropped a subject
+would be an unpleasant surprise. What you say is rewritten to the third person
+before it is stored -- "I hate mushrooms" becomes "The user hates mushrooms" --
+so it reads like every other fact instead of a pasted quote.
 
 ### What the extractor gets wrong
 
@@ -605,6 +582,80 @@ If you want 4096 anyway, quantise the KV cache on the Ollama server rather than
 buying it with CPU offload -- set `OLLAMA_FLASH_ATTENTION=1` and
 `OLLAMA_KV_CACHE_TYPE=q8_0` in your environment and restart Ollama. Untested
 here.
+
+## Timers
+
+The one genuinely useful thing she can do with no network, and the thing people
+actually say out loud to a voice.
+
+```
+you:  set a timer for ten minutes
+iris: Fine. 10 minutes.
+you:  remind me in twenty minutes to take the pizza out
+iris: Right. 20 minutes. Take the pizza out.
+      ...
+iris: That's your 20 minutes. Take the pizza out.
+```
+
+"How long is left on the timer" and "cancel the timer" work too. `--no-timers`
+switches the whole thing off.
+
+Durations are parsed rather than pattern-matched a phrase at a time: every
+quantity in the string is summed, so "one hour thirty minutes" needs no rule of
+its own. Two shapes do need one. A plural fraction with its own count --
+"three quarters of an hour" -- reads as 3.25 taken word by word, and the words
+it consumes have to be blanked out afterwards or the same string is *also*
+counted as a whole "an hour". And a bare fraction with no unit at all -- "an
+hour and a half" -- means the unit in front of it.
+
+**A command needs a duration or it is not a command.** "Set a timer" and "timer
+for the pasta" fall through to the brain untouched. Without that rule she would
+have to hold a half-finished command open across turns, and a voice that is
+silently waiting for the rest of your sentence is worse than one that just
+answers you.
+
+Two orderings matter, and both are load-bearing:
+
+- Timers are checked **before** the memory commands. "Forget the timer" is a
+  cancellation, and the memory grammar reads it as an instruction and starts
+  deleting facts about timers.
+- Firing waits for her own sentence and for yours to finish, but is **not**
+  gated on the tray mute or on paused idle chatter. Those switch off her ears
+  and her chatter; neither is a reason to swallow something she was explicitly
+  asked to say.
+
+What she says is a fixed line, not a generated one, for the reason the memory
+acknowledgements are fixed: a timer is a utility, one that waffles for two
+sentences before saying what it was for is worse than one that does not, and a
+generation that fails at the moment the timer fires is the single failure this
+feature cannot afford. `spoken()` is also deliberately not `humanize()` -- a
+timer set for an hour is "an hour", not "about an hour". Rounding is right for
+"how long have we been talking" and wrong for the one thing here whose whole
+point is that it is exact.
+
+Timers live in memory only. A countdown does not survive a restart, because
+restoring one that spent most of its span in a process that was not running is
+a worse answer than losing it. Past `timer_max_s` (twelve hours) she declines
+rather than promising something she will not be alive to do.
+
+## Hearing names she has learned
+
+`faster-whisper` accepts `hotwords`, and memory already stores the words a
+generic English model gets wrong -- your name, your pets, your projects. The
+fact table is fed straight back into the transcriber, so the longer she knows
+you the better she hears you.
+
+Measured A/B on the same audio:
+
+| | without | with |
+|---|---|---|
+| clean | "I study at Strathmore University" | unchanged |
+| noisy | "I study at **Straffnell** University" | "I study at **Strathmore** University" |
+| noisy | "Read here, talking to **IMS** about JavaScript" | "talking to **Iris** about JavaScript" |
+
+On clean audio it changes nothing. On noisy audio it recovers the names, though
+it does not fix general noise robustness -- one test line stayed garbled either
+way. No downside, and it costs nothing.
 
 ## Her voice can be cloned (currently off)
 
@@ -795,12 +846,16 @@ iris/vad.py         streaming Silero wrapper (stateful, unlike the bundled one)
 iris/mic.py         capture -> utterances, with pre-roll, hangover, speculation
 iris/stt.py         faster-whisper, plus the silence-hallucination filter
 iris/llm.py         Ollama streaming, phrase chunker, emotion tags, extraction
+iris/commands.py    spoken "remember"/"forget" grammar, shared with timers.py
+iris/timers.py      "remind me in ten minutes", spoken durations
 iris/memory.py      SQLite facts and turn log, deduplication
 iris/tts.py         Kokoro
 iris/cloning.py     Kanade voice conversion, reference encoded once
 iris/player.py      output queue with instant barge-in
 iris/motion.py      idle head and body, and the gaze model below
 iris/vtube.py       VTube Studio client: expressions, lip sync, parameter injection
+iris/overlay.py     restyles the VTube Studio window so she floats on the desktop
+iris/tray.py        tray icon, global hotkeys, push-to-talk key listener
 iris/app.py         the conversation loop
 scripts/selftest.py every stage, no microphone needed
 scripts/latency.py  the timing table above
