@@ -6,13 +6,13 @@ import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 import time
 
-from . import commands, timers
+from . import actions, commands, timers
 from .config import Config
 from .llm import Brain, clean_for_speech
 from .memory import CORRECTED, Memory
 from .mic import MicListener
 from .player import Player
-from .stt import Transcriber
+from .stt import Heard, Transcriber
 from .tts import Voice
 from .vtube import VTubeStudio
 
@@ -34,6 +34,13 @@ class Iris:
                   flush=True)
         self.screen = self._open_screen()
         self.timers = timers.Timers(cfg) if cfg.timers else None
+        self.desk = actions.Desk(cfg) if cfg.actions else None
+        # What "it" means in "turn it down", and when it stopped meaning that.
+        # Held here rather than in actions.py so the grammar stays a pure
+        # function of its arguments -- the same reason screen.py takes a
+        # reading instead of fetching one.
+        self._knob = ""
+        self._knob_at = 0.0
         self.brain = Brain(cfg, self.memory, self.screen)
         self._consolidating = threading.Event()
         print(f"waking {cfg.ollama_model}...", flush=True)
@@ -123,6 +130,17 @@ class Iris:
         self._talk_held.clear()
         self._update_mic()
 
+    @property
+    def waiting_to_talk(self) -> bool:
+        """Push-to-talk is running and its key is not down.
+
+        For anything that has to *draw* the microphone. Deliberately not
+        `listener.muted`, which also closes for the length of every reply: an
+        indicator driven off that would blink on and off through every sentence
+        she spoke, which is noise rather than information.
+        """
+        return self._ptt_armed.is_set() and not self._talk_held.is_set()
+
     def arm_push_to_talk(self, on: bool) -> None:
         """Called once the key listener is confirmed running, or has failed."""
         if on:
@@ -157,7 +175,7 @@ class Iris:
         with self._spec_lock:
             self._spec = (seq, future)
 
-    def _transcribe(self, utt) -> tuple[str, bool]:
+    def _transcribe(self, utt) -> tuple[Heard, bool]:
         with self._spec_lock:
             spec = self._spec
             self._spec = None
@@ -179,7 +197,7 @@ class Iris:
             # silence with nothing to diagnose it from.
             print(f"  [transcription gave up after {timeout:.0f}s; "
                   f"restart her if this repeats]", flush=True)
-            return "", False
+            return Heard("", 0.0, False), False
 
     # -- one turn ----------------------------------------------------------
     def _say(self, phrases, label: str = "iris: ") -> None:
@@ -203,6 +221,19 @@ class Iris:
                 # Synthesis runs ahead of the speakers, so acting on it now
                 # changed her face while an earlier phrase was still playing.
                 cue = tags[0] if tags and self.vts is not None else None
+                # A reply whose opening phrase carries no cue used to send
+                # nothing at all, which leaves the previous reply's expression
+                # sitting on her face. She drops the cue more often than it
+                # looks: measured over five ten-turn conversations, 17 replies
+                # in 50 arrived untagged, because history keeps the spoken
+                # words only and she copies what she sees there.
+                #
+                # Only the opening phrase falls back. A later one sending
+                # neutral would clear her face in the middle of a sentence,
+                # which is the same mistake as firing the cue at synthesis
+                # time rather than at playback.
+                if cue is None and first_audio is None and self.vts is not None:
+                    cue = "neutral"
                 self.player.play(audio, cue=cue)
                 if first_audio is None:
                     first_audio = time.perf_counter() - t0
@@ -220,8 +251,13 @@ class Iris:
                 time.sleep(0.15)          # let the speakers settle
             self._update_mic()
 
-    def respond(self, text: str) -> None:
-        self._say(self.brain.reply(text, self.cancel))
+    def respond(self, text: str, clear: bool = True) -> None:
+        """`clear` false means heard poorly: answer it, do not learn from it.
+
+        Typed input defaults to clear, which is the whole point of the default
+        -- nothing mishears a keyboard.
+        """
+        self._say(self.brain.reply(text, self.cancel, clear=clear))
 
     # -- timers ------------------------------------------------------------
     def handle_timer(self, text: str) -> bool:
@@ -327,6 +363,47 @@ class Iris:
         self.brain.history.append({"role": "user", "content": text})
         self.brain.history.append({"role": "assistant", "content": reply})
         self._say(iter([reply]))
+        return True
+
+    # -- doing things ------------------------------------------------------
+    def handle_action(self, text: str) -> bool:
+        """Turn the volume down, dim the screen, skip the track, open Spotify.
+
+        Runs last of the three handlers, after the timer and memory grammars,
+        because those two are explicit instructions carrying a verb of their
+        own and this one is not. "Forget the timer" has to reach timers.py, and
+        "remember to turn the volume down" is a thing to remember rather than a
+        thing to do. Both open with a word this grammar does not claim, so in
+        practice the three do not overlap -- but the order is what guarantees
+        it rather than luck.
+        """
+        if self.desk is None:
+            return False
+        fresh = time.time() - self._knob_at < self.cfg.action_context_s
+        act = actions.parse(text, last=self._knob if fresh else "",
+                            known=self.desk.names())
+        if act is None:
+            return False
+
+        line, after = self.desk.do(act)
+        if act.kind in (actions.VOLUME, actions.BRIGHTNESS):
+            self._knob, self._knob_at = act.kind, time.time()
+        said = f"  [{act.kind} {act.op}"
+        print(said + (f" {act.value}]" if act.value is not None else "]"),
+              flush=True)
+
+        # In the history but not the turn log, for the reason the memory
+        # commands are kept out of it: the extractor reading this back derives
+        # facts about the act of changing the volume, and none of them are
+        # about anybody.
+        self.brain.history.append({"role": "user", "content": text})
+        self.brain.history.append({"role": "assistant", "content": line})
+        self._say(iter([line]))
+        # The one thing that had to wait until she had spoken. _say() blocks
+        # until the speakers have drained, so the line has been heard by here
+        # -- which is the whole point for the one action that silences them.
+        if after is not None:
+            after()
         return True
 
     # -- desktop controls --------------------------------------------------
@@ -496,14 +573,20 @@ class Iris:
             return
         self.reset_idle()
         t = time.perf_counter()
-        text, hit = self._transcribe(utt)
-        if not text:
+        heard, hit = self._transcribe(utt)
+        if not heard.text:
             return
+        text = heard.text
         tag = "prefetched" if hit else "cold"
-        print(f"you: {text}   [stt {time.perf_counter() - t:.2f}s {tag}]",
+        # The confidence is printed because it is the only way to choose
+        # stt_clear_logprob for a particular microphone and room: watch what
+        # your own clean speech scores, then set the bar under it.
+        print(f"you: {text}   [stt {time.perf_counter() - t:.2f}s {tag} "
+              f"{heard.logprob:+.2f}{'' if heard.clear else ' unclear'}]",
               flush=True)
-        if not self.handle_timer(text) and not self.handle_command(text):
-            self.respond(text)
+        if not (self.handle_timer(text) or self.handle_command(text)
+                or self.handle_action(text)):
+            self.respond(text, clear=heard.clear)
         # The silence starts when she stops talking, not when they did.
         self._last_heard = time.time()
         self.maybe_consolidate()
@@ -614,7 +697,8 @@ class Iris:
                 if not text:
                     break
                 try:
-                    if not self.handle_timer(text) and not self.handle_command(text):
+                    if not (self.handle_timer(text) or self.handle_command(text)
+                            or self.handle_action(text)):
                         self.respond(text)
                 except KeyboardInterrupt:
                     raise

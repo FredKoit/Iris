@@ -60,6 +60,8 @@ def main() -> int:
                    help="only listen while the talk key is held")
     p.add_argument("--no-timers", action="store_true",
                    help="do not act on \"remind me in ten minutes\"")
+    p.add_argument("--no-actions", action="store_true",
+                   help="do not touch the volume, brightness, media or apps")
     p.add_argument("--idle-after", type=float, metavar="SECONDS",
                    help="silence before she says something unprompted")
     p.add_argument("--input-device", type=int)
@@ -91,6 +93,8 @@ def main() -> int:
         cfg.push_to_talk = True
     if args.no_timers:
         cfg.timers = False
+    if args.no_actions:
+        cfg.actions = False
     if args.idle_after is not None:
         cfg.idle_after_s = args.idle_after
     if args.input_device is not None:

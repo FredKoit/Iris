@@ -243,6 +243,19 @@ _NON_FACTS = (
     "unclear", "not stated", "n/a", "not provided", "no information",
 )
 
+# An intention said out loud is nearly always about the next hour. "The user
+# plans to watch videos" is stored here, drawn from "i am going to watch some
+# videos now" -- true for an evening, kept for good, and taking a slot in a
+# forty-fact store from something that was actually about them.
+#
+# This costs the occasional real one. A standing intention tends to be phrased
+# as a state once it is underway -- "is building a voice AI", "is studying
+# maths" -- and that phrasing passes, which is what makes the trade bearable.
+_EPHEMERAL = (
+    "the user plans to", "the user is planning to", "the user is going to",
+    "the user intends to", "the user is about to", "the user will ",
+)
+
 _LIST_MARK = re.compile(r"^\s*(?:[-*\u2022]|\d+[.)])\s*")
 
 
@@ -293,6 +306,33 @@ def grounded(fact: str, transcript: str, threshold: float) -> bool:
     return support(fact, transcript, threshold) is not None
 
 
+# The last thing in the prompt, and the only reason it exists is that it is
+# last. persona.txt has said "Two sentences. Three is already too many" from
+# the beginning, twelve lines in -- and six hundred tokens of situation and
+# memory are read after it. Measured over five eight-turn conversations she
+# broke the rule on 38 turns out of 40, averaging 4.5 sentences and getting
+# longer the further in she got. With this line closing the prompt: 15 of 40,
+# averaging 2.7 -- and the replies that invented a warm screen or a dark room
+# went with it, five to none, being the tail she no longer had room to write.
+# Wording is not what does the work here: the same sentence is in the persona
+# already and is not obeyed from there, and a longer version that also forbade
+# reading the clock out saved nothing and cost length.
+CLOSING = "Two sentences. Say the thing, then stop talking."
+
+# There is no tokenizer on this side of the Ollama API, so the prompt is sized
+# in characters, the way memory_char_budget already does it. Measured on this
+# model: 4.06 chars per token over the persona, 4.09 over the situation block,
+# 4.4 to 5.0 over conversational turns. The low end is used for both halves of
+# the sum, which overestimates what the system prompt costs and underestimates
+# what the history may spend -- wrong in the safe direction on both counts.
+_CHARS_PER_TOKEN = 4.0
+_TEMPLATE_TOKENS = 20      # chat wrapper round the messages; measured at 14
+
+
+def _estimate(text: str) -> int:
+    return int(len(text) / _CHARS_PER_TOKEN)
+
+
 class Brain:
     def __init__(self, cfg: Config, memory=None, screen=None):
         self.cfg = cfg
@@ -341,13 +381,33 @@ class Brain:
             profile = self.memory.profile()
             if profile:
                 blocks.append(f"What you know about them:\n{profile}")
+        blocks.append(CLOSING)
         return "\n\n".join(blocks)
 
+    def _recent(self, system: str) -> list[dict]:
+        """The tail of the history that fits in what is left of the window.
+
+        max_history_turns caps how many turns are kept; this caps how much of
+        the window they are allowed to cost, which is the half that actually
+        overflows. Oldest first, whole messages, because half a turn is worse
+        than no turn.
+        """
+        room = (self.cfg.num_ctx - self.cfg.reply_tokens
+                - _estimate(system) - _TEMPLATE_TOKENS)
+        budget = max(0, room) * _CHARS_PER_TOKEN
+        kept, used = [], 0
+        for msg in reversed(self.history[-self.cfg.max_history_turns * 2:]):
+            used += len(msg["content"])
+            if used > budget:
+                break
+            kept.append(msg)
+        return list(reversed(kept))
+
     def _messages(self, user_text: str) -> list[dict]:
-        keep = self.cfg.max_history_turns * 2
+        system = self._system()
         return (
-            [{"role": "system", "content": self._system()}]
-            + self.history[-keep:]
+            [{"role": "system", "content": system}]
+            + self._recent(system)
             + [{"role": "user", "content": user_text}]
         )
 
@@ -376,12 +436,12 @@ class Brain:
             return []
         # Too little to work from is where the model starts inventing. Leave the
         # turns unconsolidated and pick them up next time instead.
-        if sum(1 for _id, role, _t in rows if role == "user") < self.cfg.memory_min_turns:
+        if sum(1 for _id, role, _t, _c in rows if role == "user") < self.cfg.memory_min_turns:
             return []
 
         transcript = "\n".join(
             f"{'User' if role == 'user' else 'Assistant'}: {text}"
-            for _id, role, text in rows
+            for _id, role, text, _clear in rows
         )
         # Grounding checks against the user's own words only. Her replies stay in
         # the transcript so the model has context, but a fact has to come from
@@ -390,9 +450,17 @@ class Brain:
         # Questions are excluded too. "is it late?" produced the fact "The user
         # is not late", which is grounded in their words and still nonsense --
         # you learn about someone from what they state, not what they ask.
+        #
+        # And turns Whisper was unsure of, for the reason grounding exists at
+        # all. A misheard sentence grounds perfectly: its words really are in
+        # the transcript, the transcript is simply not what anyone said. "The
+        # user is in a setting with no after programs" is a stored fact here,
+        # drawn from a garbled turn that no check downstream of the microphone
+        # could have questioned. They stay in the transcript, so the model
+        # still reads them as context; they are just not evidence.
         said_by_user = "\n".join(
-            text for _id, role, text in rows
-            if role == "user" and not text.strip().endswith("?")
+            text for _id, role, text, clear in rows
+            if role == "user" and clear and not text.strip().endswith("?")
         )
         reply = self.client.chat(
             model=self.cfg.ollama_model,
@@ -414,6 +482,8 @@ class Brain:
                 continue          # the model drifting into commentary
             if any(bad in line.lower() for bad in _NON_FACTS):
                 continue          # "The user lives in a location unknown."
+            if line.lower().startswith(_EPHEMERAL):
+                continue          # "The user plans to watch videos."
             quote = support(line, said_by_user, self.cfg.memory_grounding)
             if quote is None:
                 continue          # invented out of thin air
@@ -440,13 +510,17 @@ class Brain:
         return {} if self.cfg.think is None else {"think": self.cfg.think}
 
     def _speak(self, messages: list[dict], cancel: threading.Event,
-               spoken: list[str], num_predict: int = 200) -> Iterator[str]:
+               spoken: list[str], num_predict: int | None = None) -> Iterator[str]:
         """Stream one generation, cut into speakable phrases.
 
         Cleaned text is accumulated into `spoken` so the caller can decide what
         to record: a reply stores a user turn and an assistant turn, an
         unprompted remark stores only the remark.
+
+        The default is the same reply_tokens that `_recent` reserved room for,
+        so the cap and the reservation cannot drift apart.
         """
+        num_predict = self.cfg.reply_tokens if num_predict is None else num_predict
         chunker = Chunker()
         stream = self.client.chat(
             model=self.cfg.ollama_model,
@@ -484,8 +558,17 @@ class Brain:
         finally:
             stream.close()
 
-    def reply(self, user_text: str, cancel: threading.Event) -> Iterator[str]:
-        """Yield speakable phrases as they are generated. Stops on `cancel`."""
+    def reply(self, user_text: str, cancel: threading.Event,
+              clear: bool = True) -> Iterator[str]:
+        """Yield speakable phrases as they are generated. Stops on `cancel`.
+
+        `clear` is whether Whisper was sure enough of `user_text` for it to be
+        believed as well as answered -- see stt.Heard. It reaches memory and
+        nothing else: she answers a half-heard sentence exactly as she would a
+        clean one, because asking someone to repeat themselves over a
+        confidence score would be worse company than occasionally
+        misunderstanding them.
+        """
         spoken: list[str] = []
         try:
             yield from self._speak(self._messages(user_text), cancel, spoken)
@@ -496,7 +579,7 @@ class Brain:
             self.history.append({"role": "user", "content": user_text})
             self.history.append({"role": "assistant", "content": said or "..."})
             if self.memory is not None:
-                self.memory.log("user", user_text)
+                self.memory.log("user", user_text, clear=clear)
                 self.memory.log("assistant", said or "...")
                 self.since_consolidation += 1
 
@@ -508,9 +591,10 @@ class Brain:
         user says.
         """
         spoken: list[str] = []
+        system = self._system()
         messages = (
-            [{"role": "system", "content": self._system()}]
-            + self.history[-self.cfg.max_history_turns * 2:]
+            [{"role": "system", "content": system}]
+            + self._recent(system)
             + [{"role": "user", "content": IDLE_NUDGE}]
         )
         try:

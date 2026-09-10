@@ -13,18 +13,81 @@ how to get it and is otherwise silently absent.
 import threading
 
 
-def _icon_image(muted: bool):
-    """A dot in her colour, dimmed when the microphone is off."""
-    from PIL import Image, ImageDraw
+# The icon says one thing: whether she can hear you right now.
+#
+#   solid dot     listening
+#   hollow ring   push-to-talk is armed and the key is up
+#   struck out    microphone deliberately off
+#
+# Drawn at 4x and downsampled, because ImageDraw does not antialias anything.
+# At 64px the disc edge is visibly stepped and the slash has ragged sides, and
+# the tray then scales that down again to 16 or 20 px, which sharpens the
+# stepping rather than hiding it. Supersampling is the whole difference between
+# this looking drawn and looking rendered.
+_SIZE = 64
+_SCALE = 4
 
-    size = 64
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+_HER_PURPLE = (196, 122, 210, 255)
+_OFF_GREY = (124, 124, 134, 255)
+_SLASH = (240, 240, 245, 255)
+_CLEAR = (0, 0, 0, 0)
+
+# Rendered once each. A held push-to-talk key redraws on every press and
+# release, and three fixed images do not need making twice.
+_CACHE: dict[tuple[bool, bool], object] = {}
+
+
+def _icon_image(muted: bool, waiting: bool = False):
+    """A dot in her colour.
+
+    `muted` wins: a microphone switched off deliberately is off whatever the
+    talk key is doing, and both are true at once whenever she is muted from the
+    tray while push-to-talk is armed. Resolving it here rather than in the
+    drawing keeps that pair to one cached image instead of two identical ones.
+    """
+    key = (muted, waiting and not muted)
+    if key not in _CACHE:
+        _CACHE[key] = _render(muted, waiting)
+    return _CACHE[key]
+
+
+def _render(muted: bool, waiting: bool):
+    from PIL import Image, ImageChops, ImageDraw
+
+    size = _SIZE * _SCALE
+    img = Image.new("RGBA", (size, size), _CLEAR)
     draw = ImageDraw.Draw(img)
-    body = (120, 120, 128, 255) if muted else (196, 122, 210, 255)
-    draw.ellipse((6, 6, size - 6, size - 6), fill=body)
+
+    def at(*fractions):
+        return tuple(f * size for f in fractions)
+
+    disc = at(0.09, 0.09, 0.91, 0.91)
+    draw.ellipse(disc, fill=_OFF_GREY if muted else _HER_PURPLE)
+
+    if waiting and not muted:
+        # Hollow, not dimmed: armed but not hearing anything. A ring keeps its
+        # meaning when the tray scales it to 16 px, where a subtler treatment
+        # -- a paler fill, a smaller dot -- just reads as the same icon again.
+        draw.ellipse(at(0.32, 0.32, 0.68, 0.68), fill=_CLEAR)
+
     if muted:
-        draw.line((14, 50, 50, 14), fill=(230, 230, 235, 255), width=7)
-    return img
+        # ImageDraw writes pixels rather than compositing them, so drawing in
+        # a fully transparent colour cuts a hole. The gap is laid down first
+        # and wider than the stroke, which is what makes this read as a slash
+        # over the dot rather than a scratch in it.
+        #
+        # Both are drawn well past the rim and then clipped back to the disc.
+        # Left to overhang they read as a line laid across the icon instead of
+        # a badge on it; stopped short of the rim they end in blunt square
+        # caps, because ImageDraw has no cap style. Clipping avoids both.
+        for fraction, colour in ((0.155, _CLEAR), (0.085, _SLASH)):
+            draw.line(at(0.02, 0.98, 0.98, 0.02),
+                      fill=colour, width=int(fraction * size))
+        mask = Image.new("L", (size, size), 0)
+        ImageDraw.Draw(mask).ellipse(disc, fill=255)
+        img.putalpha(ImageChops.multiply(img.getchannel("A"), mask))
+
+    return img.resize((_SIZE, _SIZE), Image.LANCZOS)
 
 
 class PushToTalk:
@@ -145,12 +208,29 @@ class Controls:
             item("Quit Iris", self.quit),
         )
 
-    def _refresh(self) -> None:
+    def _title(self) -> str:
+        """The hover text. Worth saying which key, since the icon cannot."""
+        if self.iris.mic_off.is_set():
+            return "Iris - microphone off"
+        if self.iris.waiting_to_talk:
+            return f"Iris - hold {self.cfg.hotkey_talk} to speak"
+        return "Iris - listening"
+
+    def _refresh(self, menu: bool = True) -> None:
+        """Redraw the icon, and by default the menu labels with it.
+
+        `menu` is off for push-to-talk, which redraws on every press and
+        release of a key somebody may be holding down: the labels cannot have
+        changed, and rebuilding them at that rate is work for nothing.
+        """
         if self.icon is None:
             return
         try:
-            self.icon.icon = _icon_image(self.iris.mic_off.is_set())
-            self.icon.update_menu()
+            self.icon.icon = _icon_image(self.iris.mic_off.is_set(),
+                                         self.iris.waiting_to_talk)
+            self.icon.title = self._title()
+            if menu:
+                self.icon.update_menu()
         except Exception:
             pass          # a tray that will not redraw must not end a conversation
 
@@ -166,7 +246,20 @@ class Controls:
             started |= self._start_hotkeys()
         if self.cfg.push_to_talk:
             started |= self._start_push_to_talk()
+        # The icon is created before push-to-talk is armed, so it starts drawn
+        # as listening whether or not she is. One redraw once everything is up
+        # settles it, rather than leaving it wrong until the first keypress.
+        self._refresh()
         return started
+
+    def _on_talk(self, held: bool) -> None:
+        """The talk key going down or up. Opens the gate, then shows it.
+
+        The microphone moves first and the icon follows, so a slow redraw can
+        never delay her hearing you.
+        """
+        self.iris.set_talk_held(held)
+        self._refresh(menu=False)
 
     def _start_push_to_talk(self) -> bool:
         """Arm the talk key, and leave her listening normally if it will not.
@@ -181,7 +274,7 @@ class Controls:
             return False
         try:
             from pynput import keyboard                       # noqa: F401
-            self.talk = PushToTalk(chord, self.iris.set_talk_held)
+            self.talk = PushToTalk(chord, self._on_talk)
             self.talk.start()
         except ImportError:
             print("  [push to talk: pip install pynput; still listening]",
@@ -207,7 +300,10 @@ class Controls:
         import pystray
 
         self.icon = pystray.Icon(
-            "iris", _icon_image(False), "Iris", menu=self._menu()
+            "iris",
+            _icon_image(self.iris.mic_off.is_set(), self.iris.waiting_to_talk),
+            self._title(),
+            menu=self._menu(),
         )
         # run() owns whatever thread it is on until stop(), so it gets its own.
         self._thread = threading.Thread(target=self._run_icon, daemon=True)

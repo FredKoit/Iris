@@ -39,7 +39,11 @@ CREATE TABLE IF NOT EXISTS turns (
     role    TEXT NOT NULL,
     text    TEXT NOT NULL,
     at      REAL NOT NULL,
-    used    INTEGER NOT NULL DEFAULT 0
+    used    INTEGER NOT NULL DEFAULT 0,
+    -- Whether Whisper was sure enough of this turn for it to be believed and
+    -- not merely answered. See stt.Heard. Turns stay in the transcript either
+    -- way; an unclear one is just not allowed to be the evidence for a fact.
+    clear   INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS turns_unused ON turns (used, id);
 """
@@ -205,13 +209,27 @@ class Memory:
         have = {r[1] for r in self.db.execute("PRAGMA table_info(facts)")}
         if "quote" not in have:
             self.db.execute("ALTER TABLE facts ADD COLUMN quote TEXT")
+        # Turns written before there were two bars default to clear. They were
+        # heard under the old rule and there is no way to score them now; the
+        # alternative, treating the whole existing log as unreliable, would
+        # throw away real history to be tidy about facts already stored.
+        have = {r[1] for r in self.db.execute("PRAGMA table_info(turns)")}
+        if "clear" not in have:
+            self.db.execute(
+                "ALTER TABLE turns ADD COLUMN clear INTEGER NOT NULL DEFAULT 1")
 
     # -- writing -----------------------------------------------------------
-    def log(self, role: str, text: str) -> None:
+    def log(self, role: str, text: str, clear: bool = True) -> None:
+        """Record a turn. `clear` is whether it may be used as evidence.
+
+        Her own turns are always clear -- nothing mishears them -- so the flag
+        only ever means something on a user turn.
+        """
         with self.lock:
             self.db.execute(
-                "INSERT INTO turns (session, role, text, at) VALUES (?, ?, ?, ?)",
-                (self.session, role, text, time.time()),
+                "INSERT INTO turns (session, role, text, at, clear) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (self.session, role, text, time.time(), int(clear)),
             )
             self.db.commit()
 
@@ -413,15 +431,16 @@ class Memory:
             used += len(text) + 3
         return "\n".join(out)
 
-    def unconsolidated(self, limit: int = 40) -> list[tuple[int, str, str]]:
+    def unconsolidated(self, limit: int = 40) -> list[tuple[int, str, str, bool]]:
         with self.lock:
-            return list(
-                self.db.execute(
-                    "SELECT id, role, text FROM turns WHERE used = 0 "
+            return [
+                (i, role, text, bool(clear))
+                for i, role, text, clear in self.db.execute(
+                    "SELECT id, role, text, clear FROM turns WHERE used = 0 "
                     "ORDER BY id LIMIT ?",
                     (limit,),
                 )
-            )
+            ]
 
     def mark_consolidated(self, ids: list[int]) -> None:
         if not ids:

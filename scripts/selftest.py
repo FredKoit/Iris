@@ -46,10 +46,54 @@ stt = Transcriber(cfg)
 stt.warm()
 print(f"  load        {time.perf_counter()-t:5.2f}s")
 t = time.perf_counter()
-text = stt(sixteen)
+heard = stt(sixteen)
 dt = time.perf_counter() - t
 print(f"  transcribe  {dt:5.2f}s for {dur:.2f}s audio  (RTF {dt/dur:.2f})")
-print(f"  heard      '{text}'")
+print(f"  heard      '{heard.text}'")
+print(f"  confidence  {heard.logprob:+.2f}  "
+      f"{'clear enough to remember' if heard.clear else 'answer only'}")
+
+print("== ACTIONS ==")
+# The grammar only, which is the half that has to be right. Nothing below
+# touches the volume, the brightness or anything that is playing: a self-test
+# that reaches for the speakers is one nobody runs twice.
+from iris import actions
+
+known = frozenset(actions.KNOWN)
+should = [
+    ("turn the volume down",            (actions.VOLUME, actions.DOWN)),
+    ("set the volume to fifty",         (actions.VOLUME, actions.SET)),
+    ("mute the sound",                  (actions.VOLUME, actions.MUTE)),
+    ("dim the screen",                  (actions.BRIGHTNESS, actions.DOWN)),
+    ("set the brightness to 40",        (actions.BRIGHTNESS, actions.SET)),
+    ("skip this song",                  (actions.MEDIA, actions.NEXT)),
+    ("pause the music",                 (actions.MEDIA, actions.PLAY)),
+    ("open spotify",                    (actions.APP, actions.LAUNCH)),
+    # Bare, and with the urgency adverb people actually put on the end. Both
+    # used to reach the brain, which answered by inventing a mute that had not
+    # happened. See "A remark is not an instruction" in the README.
+    ("mute",                            (actions.VOLUME, actions.MUTE)),
+    ("mute it now",                     (actions.VOLUME, actions.MUTE)),
+    ("open spotify now",                (actions.APP, actions.LAUNCH)),
+]
+# Remarks, questions and other people's grammars. Every one of these has to
+# reach the brain untouched -- a false positive here is her doing something to
+# the machine because of a sentence that was about something else.
+shouldnt = [
+    "the screen is at fifty percent", "the volume is at maximum",
+    "what's on my screen", "play chess with me", "open the pod bay doors",
+    "stop", "mute your mic", "remember that I hate mushrooms",
+    "set a timer for ten minutes", "I like the sound of that",
+]
+hits = sum(1 for t, want in should
+           if (lambda a: a and (a.kind, a.op) == want)(actions.parse(t, known=known)))
+miss = sum(1 for t in shouldnt if actions.parse(t, last="volume", known=known))
+print(f"  recognised  {hits}/{len(should)}   (want all)")
+print(f"  false hits  {miss}/{len(shouldnt)}   (want none)")
+t = time.perf_counter()
+for _ in range(200):
+    actions.parse("turn the volume down a bit", known=known)
+print(f"  parse       {(time.perf_counter()-t)/200*1000:5.3f}ms per utterance")
 
 print("== LLM ==")
 from iris.llm import Brain, clean_for_speech

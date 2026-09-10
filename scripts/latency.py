@@ -40,7 +40,9 @@ for t_text in TURNS:
     t = time.perf_counter(); heard = stt(audio); stt_s = time.perf_counter() - t
 
     cancel = threading.Event()
-    t = time.perf_counter(); gen = brain.reply(heard or t_text, cancel)
+    # .text, not the Heard itself: a NamedTuple is always truthy, so `heard or
+    # t_text` would quietly hand the tuple to the model.
+    t = time.perf_counter(); gen = brain.reply(heard.text or t_text, cancel)
     first = next(gen); llm_s = time.perf_counter() - t
 
     spoken, _ = clean_for_speech(first)

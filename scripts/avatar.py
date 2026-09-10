@@ -5,6 +5,8 @@
                                            can see what each does and name it
   python scripts/avatar.py --try heart      show one expression (or hotkey)
   python scripts/avatar.py --mouth         mouth-only lip sync test, no speech
+  python scripts/avatar.py --probe         what each VTS input actually moves on
+                                           this model, and which are inverted
   python scripts/avatar.py --eyes          gaze and blink, on the avatar and as
                                            a trace you can read; --talk drives it
                                            as if speaking, --dry needs no VTS
@@ -54,6 +56,116 @@ def show(vts: VTubeStudio, cfg: Config) -> None:
             print(f"   [{tag}]".ljust(16) + f"-- {miss}")
 
 
+_PROBE_INPUTS = ("FaceAngleX", "FaceAngleY", "FaceAngleZ",
+                 "FacePositionX", "FacePositionY", "FacePositionZ",
+                 "EyeLeftX", "EyeLeftY", "EyeOpenLeft",
+                 "MouthOpen", "MouthSmile", "MouthX",
+                 "Brows", "BrowLeftY", "BrowRightY", "CheekPuff", "TongueOut")
+
+
+def probe(vts: VTubeStudio) -> None:
+    """Inject each input parameter in turn and report what it actually moves.
+
+    Which VTS input reaches which rig parameter is set per model, in the VTS
+    interface, and guessing it wrong is silent -- the plugin keeps sending
+    values that land nowhere. Two things this catches are worth the round trips:
+    inputs that drive nothing at all, and inputs whose sign is inverted.
+
+    The second is the one that matters. `vtube_gaze_flip_x` and `_y` exist
+    because a head parameter may point the opposite way to the eye one, and on
+    the model this was written against the horizontal pair does while the
+    vertical pair does not. Left wrong, her head turns away from everything she
+    looks at.
+    """
+    from iris.motion import IdleMotion
+
+    rest = {k: 0.0 for k in _PROBE_INPUTS}
+    rest.update({"EyeOpenLeft": 1.0, "EyeOpenRight": 1.0})
+
+    def rig() -> dict:
+        data = vts._send("Live2DParameterListRequest", {}) or {}
+        return {p["name"]: p["value"] for p in data.get("parameters", [])}
+
+    def hold(values: dict, seconds: float) -> dict:
+        """Keep injecting for `seconds`, then read the rig.
+
+        Injecting once and waiting does not work: VTS lets a parameter fall
+        back to its tracking default as soon as the plugin stops sending it, so
+        a single injection is already decaying by the time it is read. The live
+        loop sends every frame, and so must this or it measures the way back
+        down rather than the value.
+        """
+        end = time.perf_counter() + seconds
+        while time.perf_counter() < end:
+            vts.inject(values)
+            time.sleep(0.03)
+        vts.inject(values)
+        return rig()
+
+    limits = {}
+    listed = vts._send("InputParameterListRequest", {}) or {}
+    for p in listed.get("defaultParameters", []):
+        limits[p.get("name")] = (p.get("min", -1.0), p.get("max", 1.0))
+
+    # Anything that moves while nothing is being injected is on a physics
+    # simulation -- dangling hair, an accessory, a swinging prop. Those drift
+    # far more than the rig parameters do and would otherwise fill every row
+    # and pick up meaningless INVERTED marks. Found rather than hardcoded,
+    # since every model names its trinkets differently.
+    first = hold(rest, 0.6)
+    second = hold(rest, 1.0)
+    noisy = {k for k, v in second.items() if abs(v - first.get(k, 0.0)) > 0.02}
+
+    print(f"\nmodel: {vts.model}")
+    if noisy:
+        print(f"ignoring {len(noisy)} parameters that move on their own "
+              f"(physics): {', '.join(sorted(noisy)[:6])}"
+              + (", ..." if len(noisy) > 6 else ""))
+    print()
+    print(f"{'inject':15}{'value':>8}   moves")
+    print("-" * 72)
+    for name in _PROBE_INPUTS:
+        low, high = limits.get(name, (-1.0, 1.0))
+        value = high * 0.8 if high > 0 else low * 0.8
+        # Reset everything between probes and re-read the baseline each time.
+        # Injected values persist until overwritten, so without this the tail
+        # of one probe is still settling into the next one's reading.
+        before = hold(rest, 0.5)
+        settling = hold({**rest, name: value}, 0.5)
+        after = hold({**rest, name: value}, 0.4)
+        # Moved, and then stopped moving. A driven parameter converges and
+        # holds; physics is still swinging on the second read. The tolerance
+        # has to be a fraction of the travel rather than a fixed number --
+        # ParamAngleX swings 28 units and settles to within a few tenths, which
+        # any absolute threshold tight enough for a 0..1 parameter rejects.
+        moved = []
+        for k, value_now in after.items():
+            if k in noisy:
+                continue
+            travel = value_now - before.get(k, 0.0)
+            if abs(travel) <= 0.05:
+                continue
+            if abs(value_now - settling.get(k, 0.0)) > 0.1 * abs(travel):
+                continue
+            moved.append((k, travel))
+        moved.sort(key=lambda kv: -abs(kv[1]))
+        if not moved:
+            print(f"{name:15}{value:>8.1f}   -- nothing --")
+            continue
+        parts = []
+        for k, delta in moved[:3]:
+            sign = "" if delta * value > 0 else "  <- INVERTED"
+            parts.append(f"{k} {delta:+.2f}{sign}")
+        print(f"{name:15}{value:>8.1f}   " + ", ".join(parts))
+
+    vts.inject({**IdleMotion(Config()).rest(), "MouthOpen": 0.0})
+    print("\nAn input that moves nothing is one this model does not map, so "
+          "whatever\nfeature drives it does nothing here. A head parameter "
+          "inverted against a\nnon-inverted eye one (or the reverse) is what "
+          "vtube_gaze_flip_x and _y are\nfor -- per axis, because a rig can "
+          "disagree on one and agree on the other.")
+
+
 def eyes(cfg: Config, vts: VTubeStudio | None, seconds: float, talk: bool) -> None:
     """Run the idle motion and draw where the eyes are going.
 
@@ -62,8 +174,8 @@ def eyes(cfg: Config, vts: VTubeStudio | None, seconds: float, talk: bool) -> No
     the same place is a fixation, a row that lands somewhere else is a saccade,
     and B is a blink. On a big enough jump the head should start moving a beat
     *after* the eyes, and the eyes should then ease back towards centre as it
-    catches up. If the head instead pulls away from where she just looked, set
-    vtube_gaze_flip in the config.
+    catches up. If the head instead pulls away from where she just looked, flip
+    vtube_gaze_flip_x in the config; --probe measures which way the rig goes.
     """
     from iris.motion import IdleMotion, GAZE_X, GAZE_Y, EYES_OPEN, HEAD_YAW
 
@@ -105,6 +217,9 @@ def main() -> int:
     p.add_argument("--sweep", action="store_true")
     p.add_argument("--try", dest="fire", metavar="NAME")
     p.add_argument("--mouth", action="store_true")
+    p.add_argument("--probe", action="store_true",
+                   help="which VTS input drives which rig parameter, and which "
+                        "are inverted")
     p.add_argument("--eyes", action="store_true",
                    help="run the gaze and blink model, on the avatar and as a trace")
     p.add_argument("--talk", action="store_true",
@@ -187,6 +302,9 @@ def main() -> int:
                 time.sleep(1 / cfg.vtube_lipsync_fps)
             vts.set_mouth(0.0)
             print("done")
+
+        elif args.probe:
+            probe(vts)
 
         elif args.eyes:
             eyes(cfg, None if args.dry else vts, args.seconds, args.talk)

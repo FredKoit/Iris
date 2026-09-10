@@ -129,11 +129,16 @@ class Watcher:
     # -- accounting --------------------------------------------------------
     def observe(self, app: str, title: str, now: float) -> None:
         """Fold one reading into the totals."""
-        if not app or _matches(app, self.cfg.screen_ignore):
+        if (not app or _matches(app, self.cfg.screen_ignore)
+                or (title and _matches(title, self.cfg.screen_ignore_titles))):
             # Her own window is not something they are doing, and clicking on
             # her must not make her forget what they were. Dropping `_last`
             # charges the gap to nobody rather than to whoever was in front
             # before it.
+            #
+            # Shell surfaces go the same way and have to be matched on the
+            # title: the tray flyout and the desktop are both explorer, and so
+            # is File Explorer, which is a real thing to be doing.
             self._last = None
             return
         with self._lock:

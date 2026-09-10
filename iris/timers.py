@@ -68,7 +68,23 @@ _QUANTITY = re.compile(
 )
 
 
-def _count(text: str) -> float:
+# Digits, or a number said in words, with no unit attached. Shared with
+# actions.py the way POLITE and TRAILING are shared out of commands.py: "set
+# the volume to fifty" has to mean the same fifty "fifty minutes" does, and a
+# second copy of these tables would drift from this one.
+#
+# The vague counts are deliberately not in it. "A", "half" and "a few" are
+# quantities of minutes; "turn it up a bit" is not a request for one percent.
+PLAIN = (r"\d+(?:\.\d+)?"
+         rf"|(?:{_alt(_TENS)})[\s-]+(?:{_alt(_ONES)})"
+         rf"|{_alt({**_ONES, **_TEENS, **_TENS})}")
+
+
+def count(text: str) -> float:
+    """The number a matched span of digits or words is worth.
+
+    Public because actions.py parses percentages with the same words.
+    """
     text = text.strip().lower()
     try:
         return float(text)
@@ -113,7 +129,7 @@ def duration(text: str) -> float | None:
     # Fractions first, and the words they used are blanked out afterwards: left
     # in place, "three quarters of an hour" is also read as a whole "an hour".
     for m in _FRACTION.finditer(text):
-        total += (_count(m.group("n")) * _FRACTIONS[m.group("frac").lower()]
+        total += (count(m.group("n")) * _FRACTIONS[m.group("frac").lower()]
                   * _UNITS[m.group("unit").lower()])
         found = True
     text = _FRACTION.sub(lambda m: " " * len(m.group(0)), text)
@@ -121,7 +137,7 @@ def duration(text: str) -> float | None:
     unit = None
     for m in _QUANTITY.finditer(text):
         unit = _UNITS[m.group("unit").lower()]
-        total += _count(m.group("count")) * unit
+        total += count(m.group("count")) * unit
         found = True
     if unit is not None:
         tail = _TRAILING_FRACTION.search(text)

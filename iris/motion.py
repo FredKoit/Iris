@@ -24,15 +24,26 @@ from .config import Config
 
 # VTS input parameters, which it maps onto the model's own rig:
 #   FaceAngle{X,Y,Z}   -> ParamAngle{X,Y,Z}      head turn, nod, tilt
-#   FacePosition{X,Y}  -> ParamBodyAngle{X,Z}    body lean; there is no direct
-#                                                body parameter to inject
 #   EyeOpen{Left,Right}, Eye{Left,Right}{X,Y}    blink and gaze
+#
+# FacePosition{X,Y} was believed to reach ParamBodyAngle. Probed against the
+# live model it reaches nothing at all: FacePositionX, Y and Z each move zero
+# of the rig's 97 parameters. The body does move, but off the head -- FaceAngleX
+# +24 carries ParamBodyAngleX to +7.9 on its own -- so a rig like this one gets
+# its lean free from the head and BODY_X/BODY_Y below are inert.
+#
+# They are kept because the mapping is per-model and another rig may well honour
+# them; `python scripts/avatar.py --probe` says which yours does. But on
+# 'yiyi_chair', vtube_motion_body changes nothing you can see.
 HEAD_YAW = "FaceAngleX"
 HEAD_PITCH = "FaceAngleY"
 HEAD_ROLL = "FaceAngleZ"
 BODY_X = "FacePositionX"
 BODY_Y = "FacePositionY"
 EYES_OPEN = ("EyeOpenLeft", "EyeOpenRight")
+# One channel, not two: `Brows` reaches ParamBrowLForm and ParamBrowRForm on
+# this rig, while BrowLeftY and BrowRightY reach nothing at all.
+BROWS = "Brows"
 GAZE_X = ("EyeLeftX", "EyeRightX")
 GAZE_Y = ("EyeLeftY", "EyeRightY")
 
@@ -139,6 +150,65 @@ _SPEECH_RISE = 0.25
 _SPEECH_FALL = 2.0
 
 
+# -- breathing ----------------------------------------------------------------
+#
+# Fraction of a breath spent drawing in. Breathing is not a sine: the inhale is
+# the shorter half and the exhale trails, and at rest the ratio is roughly two
+# to three. A symmetric wave at the same rate reads as a sigh over and over.
+_BREATH_INHALE = 0.4
+# The rate wanders. Nothing breathes to a metronome, and a fixed period is
+# picked up surprisingly fast on something you are watching idle. Applied as a
+# phase offset rather than a rate, so it stays a pure function of t and the
+# phase can never jump backwards.
+_BREATH_VARY = ((23.0, 1.4), (13.0, 0.3))
+
+
+def _breath_shape(u: float) -> float:
+    """-1 fully exhaled, +1 at the top of an inhale, for phase u in 0..1."""
+    if u < _BREATH_INHALE:
+        return -math.cos(math.pi * u / _BREATH_INHALE)
+    return math.cos(math.pi * (u - _BREATH_INHALE) / (1.0 - _BREATH_INHALE))
+
+
+def breath(t: float, per_min: float) -> float:
+    """Where in a breath she is at time `t`, -1..1."""
+    if per_min <= 0:
+        return 0.0
+    phase = t * per_min / 60.0 + 0.15 * _drift(t, _BREATH_VARY)
+    return _breath_shape(phase % 1.0)
+
+
+# -- speech beats -------------------------------------------------------------
+#
+# The nod that lands on a stressed syllable. Onsets are taken from the raw mouth
+# level and not from the envelope -- the opposite of the amplitude coupling,
+# and deliberately: the envelope exists to smooth the syllables away, and the
+# syllables are exactly what a beat is looking for.
+#
+# Not every syllable gets one. Stress falls on maybe one in three, and a head
+# that nods on all of them is a head keeping time rather than talking.
+_BEAT_HI = 0.38          # rising through this, having been below _BEAT_LO,
+_BEAT_LO = 0.18          # is an onset
+_BEAT_REFRACTORY = 0.13  # no two beats closer than this
+_BEAT_DUR = 0.30
+
+
+def _beat_shape(u: float) -> float:
+    """One nod: down and back, over u in 0..1. Zero at both ends."""
+    return math.sin(math.pi * u) * (1.0 - u) * 2.0
+
+
+# -- posture ------------------------------------------------------------------
+#
+# She holds a position, then changes it. Sums of sines never do: they are always
+# mid-movement, and measured, the head was under half a degree per second only
+# 18% of the time. So the wander is gated -- quiet while a posture is held, back
+# to full while she shifts to the next one, with the held offset moving as she
+# goes.
+_HOLD = (4.0, 14.0)      # seconds settled in one position
+_SHIFT = (0.6, 1.4)      # seconds spent moving to the next
+
+
 def _saccade_shape(u: float) -> float:
     """Position through a saccade, 0..1, for normalised time u in 0..1.
 
@@ -195,6 +265,21 @@ class IdleMotion:
         # Speech envelope, and the timestamp it was last advanced at.
         self._speech = 0.0
         self._last_t: float | None = None
+
+        # Speech beats: where the last nod started, how hard, and whether the
+        # mouth has dropped far enough since for the next onset to count.
+        self._beat_at = -99.0
+        self._beat_size = 0.0
+        self._beat_roll = 0.0
+        self._armed = True
+
+        # Posture: the offset she is currently holding, the one she is moving
+        # to, and when this phase ends.
+        self._posture_from = (0.0, 0.0, 0.0)
+        self._posture_to = (0.0, 0.0, 0.0)
+        self._posture_at = 0.0
+        self._posture_until = 0.0
+        self._shifting = False
 
     # -- speech ------------------------------------------------------------
     def speaking(self, t: float, level: float) -> float:
@@ -302,6 +387,75 @@ class IdleMotion:
                  * math.exp(-age / _FOLLOW_FALL) / _FOLLOW_PEAK)
         return (self._follow[0] * shape, self._follow[1] * shape)
 
+    # -- speech beats ------------------------------------------------------
+    def beat(self, t: float, level: float) -> tuple[float, float]:
+        """The nod happening right now, as (pitch, roll) in head units.
+
+        Fires on a rising mouth level, not on the envelope: the syllable is the
+        thing being looked for. Each beat gets its own size and a small roll of
+        its own sign, so a run of them does not read as a metronome.
+        """
+        cfg = self.cfg
+        if cfg.vtube_beats <= 0:
+            return (0.0, 0.0)
+
+        if level < _BEAT_LO:
+            self._armed = True
+        elif (self._armed and level > _BEAT_HI
+                and t - self._beat_at > _BEAT_REFRACTORY):
+            self._armed = False
+            if self._rng.random() < cfg.vtube_beat_chance:
+                self._beat_at = t
+                # Louder syllables get bigger nods, which is most of what makes
+                # the timing look like it belongs to the sentence.
+                self._beat_size = cfg.vtube_beats * (0.5 + 0.5 * level)
+                self._beat_roll = self._rng.uniform(-0.5, 0.5)
+
+        age = t - self._beat_at
+        if age < 0.0 or age >= _BEAT_DUR:
+            return (0.0, 0.0)
+        shape = _beat_shape(age / _BEAT_DUR) * self._beat_size
+        # Down, not up: a beat drops the chin and brings it back.
+        return (-shape, shape * self._beat_roll)
+
+    # -- posture -----------------------------------------------------------
+    def posture(self, t: float) -> tuple[float, float, float, float]:
+        """(wander gain, yaw, pitch, roll offsets) for the settling cycle."""
+        cfg = self.cfg
+        if t >= self._posture_until:
+            self._plan_posture(t)
+
+        span = max(1e-6, self._posture_until - self._posture_at)
+        u = _clamp((t - self._posture_at) / span, 0.0, 1.0)
+        if not self._shifting:
+            # Held. Full stillness in the middle, easing out of and back into
+            # the shifts either side so nothing starts or stops abruptly.
+            edge = min(1.0, min(u, 1.0 - u) / 0.15)
+            gain = 1.0 - (1.0 - cfg.vtube_settle) * (edge * edge * (3 - 2 * edge))
+            return (gain,) + self._posture_to
+
+        eased = u * u * (3.0 - 2.0 * u)
+        offsets = tuple(a + (b - a) * eased
+                        for a, b in zip(self._posture_from, self._posture_to))
+        return (1.0,) + offsets
+
+    def _plan_posture(self, t: float) -> None:
+        rng = self._rng
+        self._posture_at = t
+        if self._shifting:
+            self._shifting = False
+            self._posture_until = t + rng.uniform(*_HOLD)
+            return
+        self._shifting = True
+        self._posture_until = t + rng.uniform(*_SHIFT)
+        self._posture_from = self._posture_to
+        # Offsets are in the same units as the wander, and deliberately smaller
+        # than it: this is settling into a slightly different position, not
+        # striking a pose.
+        self._posture_to = (rng.uniform(-0.5, 0.5),
+                            rng.uniform(-0.4, 0.4),
+                            rng.uniform(-0.4, 0.4))
+
     # -- blink -------------------------------------------------------------
     def _schedule_blink(self, t: float, speech: float) -> None:
         """Fix this blink's duration and the wait until the next one."""
@@ -345,28 +499,53 @@ class IdleMotion:
         cfg = self.cfg
         level = _clamp(level, 0.0, 1.0)
         speech = self.speaking(t, level)
-        gain = 1.0 + cfg.vtube_motion_speech * level
+        # The envelope, not the raw level -- the same distinction gaze and blink
+        # already make, and for the same reason. `level` is the mouth parameter,
+        # which swings between nothing and wide open at syllable rate, and
+        # multiplying the head's slow drift by it amplitude-modulates the head
+        # at 4-5 Hz. Measured, that was 14.3 deg/s of average head movement
+        # against 3.6 with the ripple removed: not a nod, not a gesture, just a
+        # tremor proportional to wherever the drift happened to be. Widening on
+        # the envelope is what the line above actually describes.
+        gain = 1.0 + cfg.vtube_motion_speech * speech
         head, body = cfg.vtube_motion_head * gain, cfg.vtube_motion_body * gain
 
         # Gaze first: it is what decides where the head is going next.
         gaze_x, gaze_y = self.gaze(t, speech)
-        # Sign of the head parameters relative to the eye ones. See the config.
-        sign = -1.0 if cfg.vtube_gaze_flip else 1.0
+        # Sign of the head parameter against the eye one, per axis: on this rig
+        # they disagree horizontally and agree vertically. See the config.
+        sign_x = -1.0 if cfg.vtube_gaze_flip_x else 1.0
+        sign_y = -1.0 if cfg.vtube_gaze_flip_y else 1.0
         follow_x, follow_y = self.head_follow(t)
 
-        yaw = _drift(t, _WAVES[HEAD_YAW]) + sign * cfg.vtube_gaze_head * follow_x
-        pitch = 0.6 * (_drift(t, _WAVES[HEAD_PITCH])
-                       + sign * cfg.vtube_gaze_head * follow_y)
+        # Settling gates the wander; the offsets are the position being held.
+        wander, off_yaw, off_pitch, off_roll = self.posture(t)
+        beat_pitch, beat_roll = self.beat(t, level)
+        air = breath(t, cfg.vtube_breath_per_min)
+
+        yaw = (wander * _drift(t, _WAVES[HEAD_YAW]) + off_yaw
+               + sign_x * cfg.vtube_gaze_head * follow_x)
+        pitch = 0.6 * (wander * _drift(t, _WAVES[HEAD_PITCH]) + off_pitch
+                       + sign_y * cfg.vtube_gaze_head * follow_y)
+        # Tilt goes partly with the turn. Left to its own sine it correlated
+        # with the turn at r = 0.00, which is two animations, not one neck.
+        roll = (wander * 0.5 * _drift(t, _WAVES[HEAD_ROLL]) + off_roll
+                + cfg.vtube_head_tilt_follow * yaw)
 
         out = {
+            # Breath and beats are in degrees already, so they go on after the
+            # speech gain rather than being widened by it: she does not breathe
+            # deeper because she is mid-sentence, and a beat is its own size.
             HEAD_YAW:   head * yaw,
-            HEAD_PITCH: head * pitch,
-            HEAD_ROLL:  head * 0.5 * _drift(t, _WAVES[HEAD_ROLL]),
-            BODY_X:     body * _drift(t, _WAVES[BODY_X]),
-            # Body Y carries the breathing: the rig has a ParamBreath, but VTS
-            # exposes no input parameter that reaches it, so a slow vertical
-            # settle stands in for it.
-            BODY_Y:     body * 0.5 * _drift(t, _WAVES[BODY_Y]),
+            HEAD_PITCH: head * pitch + cfg.vtube_breath * air
+                        + cfg.vtube_motion_head * 0.12 * beat_pitch,
+            HEAD_ROLL:  head * roll + cfg.vtube_motion_head * 0.12 * beat_roll,
+            # Both of these reach nothing on 'yiyi_chair' -- see the note at the
+            # top. They are still driven correctly for rigs that map them: the
+            # lean goes with the turn, and the rise and fall is the breath.
+            BODY_X:     body * (wander * _drift(t, _WAVES[BODY_X])
+                                + cfg.vtube_head_tilt_follow * yaw),
+            BODY_Y:     body * 0.5 * air,
         }
 
         # Vestibulo-ocular: the eyes hold their point while the head moves
@@ -374,11 +553,11 @@ class IdleMotion:
         # the head catches up with a glance -- head_follow above pushes the
         # head one way and this pulls the eyes the other, so the two couplings
         # together produce eyes-lead-head-follows out of nothing but their
-        # signs. Get that sign wrong and they swing out together instead, which
-        # is the failure mode vtube_gaze_flip exists for.
-        vor = sign * cfg.vtube_gaze_vor * cfg.vtube_gaze
-        gaze_x = _clamp(gaze_x - vor * _clamp(yaw, -1.5, 1.5))
-        gaze_y = _clamp(gaze_y - vor * _clamp(pitch, -1.5, 1.5))
+        # signs. Get a sign wrong and they swing out together instead, which
+        # is the failure mode the two flip flags exist for.
+        vor = cfg.vtube_gaze_vor * cfg.vtube_gaze
+        gaze_x = _clamp(gaze_x - sign_x * vor * _clamp(yaw, -1.5, 1.5))
+        gaze_y = _clamp(gaze_y - sign_y * vor * _clamp(pitch, -1.5, 1.5))
 
         opened = self.eye_openness(t, speech)
         if cfg.vtube_gaze > 0.0:
@@ -390,18 +569,40 @@ class IdleMotion:
             opened *= 1.0 + cfg.vtube_lid_follow * below
         opened = _clamp(opened, 0.0, 1.0)
 
+        # Brows lift with an upward glance and with the emphasis of a beat.
+        # The lid coupling below covers looking down; this is the other half of
+        # it, and the half that needs a brow to exist.
+        #
+        # Measured from neutral, not from zero: on this rig zero is the bottom
+        # of the brow's travel, so a lift of "none" sent as 0 pins them at one
+        # extreme and holds them there. The two reasons are summed and capped
+        # before scaling, so the top of the movement cannot exceed the knob.
+        lift = 0.0
+        if cfg.vtube_gaze > 0.0:
+            up = _clamp(gaze_y / (cfg.vtube_gaze * _VERTICAL), 0.0, 1.0)
+            lift = _clamp(up + 0.6 * max(0.0, -beat_pitch), 0.0, 1.0)
+        out[BROWS] = _clamp(cfg.vtube_brows_neutral + cfg.vtube_brows * lift,
+                            0.0, 1.0)
+
         for eye in EYES_OPEN:
             out[eye] = opened
         for eye in GAZE_X:
             out[eye] = gaze_x
         for eye in GAZE_Y:
-            out[eye] = gaze_y
+            # Offset only on the way out. Everything above -- the lid coupling,
+            # the brows, the vestibulo-ocular term -- works in a space where
+            # zero means straight ahead, and only the rig disagrees.
+            out[eye] = _clamp(cfg.vtube_gaze_y_neutral + gaze_y)
         return out
 
     def rest(self) -> dict[str, float]:
         """Everything centred, eyes open. Sent on the way out so she is not
         left frozen at whatever angle the last frame happened to land on."""
-        out = {k: 0.0 for k in (HEAD_YAW, HEAD_PITCH, HEAD_ROLL, BODY_X, BODY_Y)}
-        out.update({k: 0.0 for k in GAZE_X + GAZE_Y})
+        out = {k: 0.0 for k in (HEAD_YAW, HEAD_PITCH, HEAD_ROLL,
+                                BODY_X, BODY_Y)}
+        out.update({k: 0.0 for k in GAZE_X})
+        out.update({k: self.cfg.vtube_gaze_y_neutral for k in GAZE_Y})
+        # Not zero: zero is one end of the brow's travel, not the middle of it.
+        out[BROWS] = self.cfg.vtube_brows_neutral
         out.update({k: 1.0 for k in EYES_OPEN})
         return out
